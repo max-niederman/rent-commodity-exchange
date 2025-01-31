@@ -3,22 +3,28 @@
 extern crate test;
 
 pub use order::Order;
+use russcip::{ProblemCreated, prelude::*};
 
 pub mod order;
 
+#[derive(Debug)]
 pub struct Problem {
-    fulfillments: Vec<microlp::Variable>,
-    inner: microlp::Problem,
+    fulfillments: Vec<russcip::Variable>,
+    model: Model<ProblemCreated>,
 }
 
 impl Problem {
     pub fn new(orders: &[Order], t_max: usize) -> Self {
-        let mut inner = microlp::Problem::new(microlp::OptimizationDirection::Maximize);
+        let mut model = Model::default().maximize();
+
+        if cfg!(not(debug_assertions)) {
+            model = model.hide_output();
+        }
 
         // Add a variable for each order.
         let mut fulfillments = vec![];
         for (i, order) in orders.iter().enumerate() {
-            fulfillments.push(inner.add_binary_var(order.quote_fulfillment()));
+            fulfillments.push(model.add(var().binary().obj(order.quote_fulfillment())));
         }
 
         // Column-major matrix mapping order fulfillments to capacity requirements.
@@ -29,31 +35,30 @@ impl Problem {
 
         // Add the capacity constraints.
         for t in 0..t_max {
-            inner.add_constraint(
-                capacity_mat
-                    .iter()
-                    .enumerate()
-                    .map(|(i, shape)| (fulfillments[i], shape[t] as f64)),
-                microlp::ComparisonOp::Le,
-                0.0,
-            )
+            let mut constraint = cons();
+
+            for (i, shape) in capacity_mat.iter().enumerate() {
+                constraint = constraint.coef(&fulfillments[i], shape[t] as f64);
+            }
+
+            model.add(constraint.le(0.0));
         }
 
         Self {
             fulfillments,
-            inner,
+            model,
         }
     }
 
     /// Solve the problem to get the (surplus, fulfillment) tuple.
-    pub fn solve(&self) -> (f64, Vec<bool>) {
-        let solution = self.inner.solve().unwrap();
+    pub fn solve(self) -> (f64, Vec<bool>) {
+        let solution = self.model.solve().best_sol().expect("no solution found");
 
         (
-            solution.objective(),
+            solution.obj_val(),
             self.fulfillments
                 .iter()
-                .map(|&var| *solution.var_value(var) > 0.5)
+                .map(|var| solution.val(var) > 0.5)
                 .collect(),
         )
     }
@@ -95,16 +100,13 @@ mod tests {
     fn bench_problem_construction(b: &mut test::Bencher) {
         let t_max = 24 * 7;
 
-        let orders = random_orders(1000, t_max);
-        b.iter(|| Problem::new(&orders, t_max));
+        b.iter(|| Problem::new(&random_orders(1000, t_max), t_max));
     }
 
     #[bench]
     fn bench_problem_solve(b: &mut test::Bencher) {
         let t_max = 24 * 7;
 
-        let orders = random_orders(10, t_max);
-        let problem = Problem::new(&orders, t_max);
-        b.iter(|| problem.solve());
+        b.iter(|| Problem::new(&random_orders(1000, t_max), t_max).solve());
     }
 }
